@@ -14,14 +14,19 @@ from torchvision import transforms
 # Flask setup
 # ------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
+
+# ------------------------------
+# Device
+# ------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logging.info(f"Using device: {DEVICE}")
 
 # ------------------------------
 # Global model cache
 # ------------------------------
 models = {}
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ------------------------------
 # Advanced tongue colour analysis
@@ -41,7 +46,6 @@ COAT_LIMITS = {
 }
 
 def hsv_stats(img_np):
-    """Compute HSV statistics from RGB numpy array."""
     hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV).astype(float)
     h, s, v = cv2.split(hsv)
     return {
@@ -52,7 +56,6 @@ def hsv_stats(img_np):
     }
 
 def coating_ratio(img_np):
-    """Detect white coating and return (coated_bool, ratio)."""
     hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
     mask = cv2.inRange(hsv, (0, 0, WHITE_V_MIN), (180, WHITE_S_MAX, 255))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
@@ -60,11 +63,10 @@ def coating_ratio(img_np):
     blobs = [np.sum(labels == i) for i in range(1, labels.max() + 1)
              if np.sum(labels == i) > MIN_BLOB_AREA]
     total_pixels = img_np.shape[0] * img_np.shape[1]
-    ratio = float(sum(blobs) / total_pixels)
+    ratio = float(sum(blobs) / total_pixels) if total_pixels > 0 else 0.0
     return bool(ratio > COAT_THRESHOLD), ratio
 
 def refine(cls, st):
-    """Refine model prediction using HSV rules."""
     mh, ms, mv = st['mh'], st['ms'], st['mv']
     red_hue    = (mh <= 15) or (mh >= 168)
     purple_hue = (110 <= mh <= 165)
@@ -77,11 +79,9 @@ def refine(cls, st):
         if v >= 185 and base == "purple":        return "pale purple"
         return base
 
-    # Purple/violet hue overrides model
     if purple_hue and ms >= 25:
         return purple_family(mh, mv)
 
-    # Very bright surface
     if mv >= 200:
         if red_hue and ms < 90:  return "pale pink"
         if ms < 90:              return "pale"
@@ -126,7 +126,6 @@ def refine(cls, st):
     return cls
 
 def coating_override(colour, coated, ratio, st):
-    """Apply coating detection override."""
     if not coated:
         return colour
     red_hue = (st['mh'] <= 15) or (st['mh'] >= 168)
@@ -141,10 +140,11 @@ def coating_override(colour, coated, ratio, st):
             return colour
     return "white coated" if ratio >= COAT_LIMITS.get(colour, COAT_THRESHOLD) else colour
 
-def load_color_model():
+def load_color_model(model_path="efficientnetv2_tongue_color_50epochs.pth"):
     """Load EfficientNetV2-B2 colour model."""
-    MODEL_PATH = "efficientnetv2_tongue_color_50epochs.pth"
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    checkpoint = torch.load(model_path, map_location=DEVICE)
     class_names = checkpoint['class_names']
     img_size = checkpoint.get('img_size', 224)
     backbone = checkpoint.get('backbone', 'tf_efficientnetv2_b2.in1k')
@@ -166,11 +166,6 @@ def load_color_model():
     }
 
 def predict_advanced_color(color_model, pil_img):
-    """
-    Run full colour pipeline.
-    Returns dict with only: final_colour, base_colour, confidence, coated, coating_ratio.
-    """
-    # Model inference
     tensor = color_model['transform'](pil_img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         logits = color_model['model'](tensor)
@@ -179,12 +174,10 @@ def predict_advanced_color(color_model, pil_img):
     raw_class = color_model['class_names'][idx]
     confidence = probs[idx]
 
-    # HSV and coating
     img_np = np.array(pil_img.convert('RGB'))
     st = hsv_stats(img_np)
     coated, ratio = coating_ratio(img_np)
 
-    # Refine and override
     base_colour = refine(raw_class, st)
     final_colour = coating_override(base_colour, coated, ratio, st)
 
@@ -197,10 +190,9 @@ def predict_advanced_color(color_model, pil_img):
     }
 
 # ------------------------------
-# Dummy placeholders for other models (replace with actual imports)
+# Placeholders for other models (replace with your actual models)
 # ------------------------------
 def load_texture_model():
-    # Placeholder – replace with your actual texture model loading
     return None
 
 def load_shape_cnn():
@@ -213,16 +205,15 @@ def load_crack_model():
     return None
 
 def predict_texture(model, pil_img):
-    return {"label": "normal"}  # Placeholder
+    return {"label": "normal"}
 
 def predict_shape(cnn_model, classes, ml_model, pil_img):
-    return {"label": "normal"}  # Placeholder
+    return {"label": "normal"}
 
 def predict_crack(model, pil_img):
-    return {"label": "non_cracked"}  # Placeholder
+    return {"label": "non_cracked"}
 
 def detect_coating(pil_img):
-    # Already handled in advanced colour pipeline; return placeholder
     return {"label": "none"}
 
 def encode_image(pil_img):
@@ -235,7 +226,9 @@ def encode_image(pil_img):
 # ------------------------------
 def load_all_models():
     logging.info("Loading colour model (advanced pipeline)...")
-    models["color"] = load_color_model()
+    # CHANGE THIS PATH to your actual model file location
+    MODEL_FILE = "/content/drive/MyDrive/efficientnetv2_tongue_color_50epochs.pth"
+    models["color"] = load_color_model(MODEL_FILE)
     logging.info("Loading texture model...")
     models["texture"] = load_texture_model()
     logging.info("Loading shape CNN and ML ensemble...")
@@ -246,7 +239,7 @@ def load_all_models():
     logging.info("All models loaded.")
 
 # ------------------------------
-# Confidence score (unchanged)
+# Confidence score
 # ------------------------------
 def compute_confidence(color_label, texture_label, shape_label, crack_label, coating_label):
     color_weights = {"pink":1.0, "white":0.5, "red":0.35, "purple":0.25, "indigo_violet":0.2}
@@ -286,14 +279,14 @@ def analyze():
     except Exception as e:
         return jsonify({"status": "error", "message": f"Invalid image: {str(e)}"}), 400
 
-    # Colour analysis (advanced)
+    # Colour analysis
     try:
         color_result = predict_advanced_color(models["color"], pil_img)
     except Exception as e:
         logging.error(f"Colour model error: {e}")
         color_result = {"final_colour": "error", "base_colour": "error", "confidence": 0, "coated": False, "coating_ratio": 0.0}
 
-    # Other models (with fallbacks)
+    # Other models
     try:
         texture_result = predict_texture(models["texture"], pil_img)
     except Exception as e:
@@ -315,7 +308,7 @@ def analyze():
         logging.error(f"Coating detection error: {e}")
         coating_result = {"label": "error"}
 
-    # Overall confidence (using refined final_colour as colour label)
+    # Overall confidence using refined final_colour
     overall_confidence = compute_confidence(
         color_result["final_colour"], 
         texture_result["label"], 
@@ -324,13 +317,13 @@ def analyze():
         coating_result["label"]
     )
 
-    # Encode image for response
+    # Encode image
     img_base64 = encode_image(pil_img)
 
     response = {
         "status": "success",
         "uploaded_image": img_base64,
-        "color": color_result,        # contains final_colour, base_colour, confidence, coated, coating_ratio
+        "color": color_result,
         "texture": texture_result,
         "shape": shape_result,
         "cracks": crack_result,
