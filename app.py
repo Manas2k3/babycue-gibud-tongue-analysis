@@ -1,267 +1,233 @@
 import os
 import io
 import logging
-import numpy as np
-import cv2
-import torch
-import timm
-from flask import Flask, request, jsonify
-from PIL import Image
-import base64
-from torchvision import transforms
 
-# ------------------------------
-# Flask setup
-# ------------------------------
+import torch
+from flask import Flask, request, jsonify, render_template_string
+from PIL import Image
+
+from utils.color_utils   import load_color_model, predict_advanced_color
+from utils.texture_utils import load_texture_model, predict_texture
+from utils.shape_utils   import load_shape_cnn, load_shape_ml, predict_shape
+from utils.crack_utils   import load_crack_model, predict_crack
+from utils.image_utils   import encode_image
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 
-# ------------------------------
-# Device
-# ------------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.info(f"Using device: {DEVICE}")
 
-# ------------------------------
-# Global model cache
-# ------------------------------
-models = {}
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 
-# ------------------------------
-# Advanced tongue colour analysis
-# ------------------------------
-WHITE_V_MIN      = 200
-WHITE_S_MAX      = 40
-COAT_THRESHOLD   = 0.08
-MIN_BLOB_AREA    = 400
-
-COAT_LIMITS = {
-    "deep red": 0.25, "red": 0.20, "dark red purple": 0.22,
-    "pink": 0.15, "pale red": 0.10, "pale pink": 0.09,
-    "pale": 0.08, "white": 0.08,
-    "purple": 0.18, "pale purple": 0.15,
-    "indigo violet": 0.18, "pale indigo violet": 0.15,
-    "blue purple": 0.18,
+MODEL_PATHS = {
+    "color":     os.path.join(MODELS_DIR, "efficientnetv2_tongue_color_50epochs.pth"),
+    "shape_cnn": os.path.join(MODELS_DIR, "tongue_cnn_v3.pth"),
+    "shape_ml":  os.path.join(MODELS_DIR, "tongue_ml_ensemble.pkl"),
+    "crack":     os.path.join(MODELS_DIR, "cracked_binary_resnet5.pth"),
 }
 
-def hsv_stats(img_np):
-    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV).astype(float)
-    h, s, v = cv2.split(hsv)
-    return {
-        'mh':   float(np.median(h)),
-        'ms':   float(np.median(s)),
-        'mv':   float(np.median(v)),
-        'p75s': float(np.percentile(s, 75)),
-    }
+models = {}
 
-def coating_ratio(img_np):
-    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-    mask = cv2.inRange(hsv, (0, 0, WHITE_V_MIN), (180, WHITE_S_MAX, 255))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
-    _, labels = cv2.connectedComponents(mask)
-    blobs = [np.sum(labels == i) for i in range(1, labels.max() + 1)
-             if np.sum(labels == i) > MIN_BLOB_AREA]
-    total_pixels = img_np.shape[0] * img_np.shape[1]
-    ratio = float(sum(blobs) / total_pixels) if total_pixels > 0 else 0.0
-    return bool(ratio > COAT_THRESHOLD), ratio
-
-def refine(cls, st):
-    mh, ms, mv = st['mh'], st['ms'], st['mv']
-    red_hue    = (mh <= 15) or (mh >= 168)
-    purple_hue = (110 <= mh <= 165)
-
-    def purple_family(h, v):
-        if h < 131:          base = "purple"
-        elif h < 159:        base = "indigo violet"
-        else:                base = "blue purple"
-        if v >= 185 and base == "indigo violet": return "pale indigo violet"
-        if v >= 185 and base == "purple":        return "pale purple"
-        return base
-
-    if purple_hue and ms >= 25:
-        return purple_family(mh, mv)
-
-    if mv >= 200:
-        if red_hue and ms < 90:  return "pale pink"
-        if ms < 90:              return "pale"
-        return "pale red"
-    if mv >= 160 and ms < 80:
-        return "pale pink"
-
-    # Per-class logic
-    if cls == "deep_red":
-        if ms < 70 or (mv >= 150 and ms < 100): return "pale"
-        if red_hue and ms >= 120 and mv < 160:  return "deep red"
-        if red_hue and ms >= 100 and mv >= 160: return "red"
-        if ms >= 80 and mv < 120:               return "deep red"
-        return "deep red"
-
-    if cls == "healthy":
-        if ms < 60:                              return "pale pink"
-        if red_hue and ms >= 160 and mv < 150:  return "deep red"
-        if red_hue and ms >= 120 and mv < 160:  return "deep red"
-        if ms >= 100 and mv >= 160:             return "red"
-        if ms >= 100 and red_hue:               return "deep red"
-        return "pink"
-
-    if cls == "white":
-        if purple_hue and ms >= 20:             return purple_family(mh, mv)
-        if ms > 90:                             return "pale red"
-        if ms > 55:                             return "pale pink"
-        return "white"
-
-    if cls == "indigo_violet":
-        if red_hue and ms >= 120 and mv < 160:  return "deep red"
-        if red_hue and ms >= 80:                return "red"
-        if not purple_hue:                      return "red"
-        return purple_family(mh, mv)
-
-    if cls == "purple":
-        if red_hue and ms >= 120 and mv < 160:  return "deep red"
-        if red_hue and ms >= 80:                return "red"
-        if mh < 128:                            return "dark red purple"
-        return purple_family(mh, mv)
-
-    return cls
-
-def coating_override(colour, coated, ratio, st):
-    if not coated:
-        return colour
-    red_hue = (st['mh'] <= 15) or (st['mh'] >= 168)
-    p75s = st['p75s']
-    if red_hue and colour in ("pale pink", "pale", "pale red", "pink"):
-        sat_spread = p75s - st['ms']
-        if sat_spread >= 25 and ratio >= 0.18:
-            return "white coated"
-        elif ratio >= 0.40:
-            return "white coated"
-        else:
-            return colour
-    return "white coated" if ratio >= COAT_LIMITS.get(colour, COAT_THRESHOLD) else colour
-
-def load_color_model(model_path="efficientnetv2_tongue_color_50epochs.pth"):
-    """Load EfficientNetV2-B2 colour model."""
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-    checkpoint = torch.load(model_path, map_location=DEVICE)
-    class_names = checkpoint['class_names']
-    img_size = checkpoint.get('img_size', 224)
-    backbone = checkpoint.get('backbone', 'tf_efficientnetv2_b2.in1k')
-    model = timm.create_model(backbone, pretrained=False, num_classes=len(class_names))
-    model.load_state_dict(checkpoint['model_state'])
-    model.to(DEVICE)
-    model.eval()
-    transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-    return {
-        'model': model,
-        'class_names': class_names,
-        'transform': transform,
-        'img_size': img_size
-    }
-
-def predict_advanced_color(color_model, pil_img):
-    tensor = color_model['transform'](pil_img).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        logits = color_model['model'](tensor)
-        probs = torch.softmax(logits, dim=1).squeeze().cpu().tolist()
-    idx = probs.index(max(probs))
-    raw_class = color_model['class_names'][idx]
-    confidence = probs[idx]
-
-    img_np = np.array(pil_img.convert('RGB'))
-    st = hsv_stats(img_np)
-    coated, ratio = coating_ratio(img_np)
-
-    base_colour = refine(raw_class, st)
-    final_colour = coating_override(base_colour, coated, ratio, st)
-
-    return {
-        'final_colour': final_colour,
-        'base_colour': base_colour,
-        'confidence': round(confidence * 100, 2),
-        'coated': coated,
-        'coating_ratio': ratio,
-    }
-
-# ------------------------------
-# Placeholders for other models (replace with your actual models)
-# ------------------------------
-def load_texture_model():
-    return None
-
-def load_shape_cnn():
-    return None, None
-
-def load_shape_ml():
-    return None
-
-def load_crack_model():
-    return None
-
-def predict_texture(model, pil_img):
-    return {"label": "normal"}
-
-def predict_shape(cnn_model, classes, ml_model, pil_img):
-    return {"label": "normal"}
-
-def predict_crack(model, pil_img):
-    return {"label": "non_cracked"}
-
-def detect_coating(pil_img):
-    return {"label": "none"}
-
-def encode_image(pil_img):
-    buffered = io.BytesIO()
-    pil_img.save(buffered, format="JPEG")
-    return base64.b64encode(buffered.getvalue()).decode()
-
-# ------------------------------
-# Load all models
-# ------------------------------
 def load_all_models():
-    logging.info("Loading colour model (advanced pipeline)...")
-    # CHANGE THIS PATH to your actual model file location
-    MODEL_FILE = "/content/drive/MyDrive/efficientnetv2_tongue_color_50epochs.pth"
-    models["color"] = load_color_model(MODEL_FILE)
+    logging.info("Loading colour model...")
+    models["color"] = load_color_model(MODEL_PATHS["color"], DEVICE)
+
     logging.info("Loading texture model...")
     models["texture"] = load_texture_model()
-    logging.info("Loading shape CNN and ML ensemble...")
-    models["shape_cnn"], models["shape_classes"] = load_shape_cnn()
-    models["shape_ml"] = load_shape_ml()
+
+    logging.info("Loading shape CNN...")
+    models["shape_cnn"], models["shape_classes"] = load_shape_cnn(
+        MODEL_PATHS["shape_cnn"], DEVICE
+    )
+
+    logging.info("Loading shape ML ensemble...")
+    models["shape_ml"] = load_shape_ml(MODEL_PATHS["shape_ml"])
+
     logging.info("Loading crack model...")
-    models["crack"] = load_crack_model()
-    logging.info("All models loaded.")
+    models["crack"] = load_crack_model(MODEL_PATHS["crack"], DEVICE)
 
-# ------------------------------
-# Confidence score
-# ------------------------------
-def compute_confidence(color_label, texture_label, shape_label, crack_label, coating_label):
-    color_weights = {"pink":1.0, "white":0.5, "red":0.35, "purple":0.25, "indigo_violet":0.2}
-    texture_weights = {"normal":1.0, "tender":0.5, "tough":0.35}
-    shape_weights = {"normal":1.0, "oval":0.7, "rectangle":0.6}
-    crack_weights = {"non_cracked":1.0, "cracked":0.3}
-    coating_weights = {"none":1.0, "white":0.4}
-    score = (color_weights.get(color_label, 0.5) * 0.25 +
-             texture_weights.get(texture_label, 0.5) * 0.20 +
-             shape_weights.get(shape_label, 0.7) * 0.20 +
-             crack_weights.get(crack_label, 0.5) * 0.20 +
-             coating_weights.get(coating_label, 0.5) * 0.15)
-    if score >= 0.8: band = "Almost Perfect"
-    elif score >= 0.6: band = "Substantial"
-    elif score >= 0.4: band = "Moderate"
-    elif score >= 0.2: band = "Fair"
-    else: band = "Poor"
-    return {"score": round(score,4), "band": band}
+    logging.info("All models loaded successfully.")
 
-# ------------------------------
+# ------------------------------------------------------------------
+# HTML Template – Color Analysis only (no confidence, no overall health)
+# ------------------------------------------------------------------
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Tongue Analysis API</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header { text-align: center; color: white; margin-bottom: 40px; }
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .upload-section { background: white; border-radius: 10px; padding: 30px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); margin-bottom: 20px; }
+        .upload-area { border: 3px dashed #667eea; border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; transition: all 0.3s; }
+        .upload-area:hover { border-color: #764ba2; background: #f5f5f5; }
+        .upload-area input { display: none; }
+        .upload-label { cursor: pointer; display: block; }
+        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; font-size: 1em; margin-top: 15px; transition: transform 0.2s; }
+        .btn:hover { transform: scale(1.05); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: scale(1); }
+        .loading { display: none; text-align: center; color: #667eea; margin: 20px 0; }
+        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #667eea; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 0 auto 10px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .results { background: white; border-radius: 10px; padding: 30px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+        .result-hidden { display: none; }
+        .result-item { margin: 20px 0; padding: 15px; background: #f9f9f9; border-left: 4px solid #667eea; border-radius: 4px; }
+        .result-item h3 { color: #667eea; margin-bottom: 8px; }
+        .result-item p { color: #555; }
+        .image-preview { margin: 20px 0; text-align: center; }
+        .image-preview img { max-width: 300px; border-radius: 8px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+        .error { color: #e74c3c; background: #fadbd8; padding: 15px; border-radius: 5px; border-left: 4px solid #e74c3c; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌍 Tongue Analysis</h1>
+            <p>Upload an image for AI-powered tongue analysis</p>
+        </div>
+        
+        <div class="upload-section">
+            <form id="uploadForm" enctype="multipart/form-data">
+                <div class="upload-area" onclick="document.getElementById('imageInput').click()">
+                    <label class="upload-label" for="imageInput">
+                        <div style="font-size: 2em; margin-bottom: 10px;">📸</div>
+                        <div><strong>Click to upload or drag and drop</strong></div>
+                        <div style="color: #999; font-size: 0.9em; margin-top: 5px;">JPG, PNG (Max 16MB)</div>
+                    </label>
+                    <input id="imageInput" type="file" accept="image/*" required />
+                </div>
+                <button type="submit" class="btn">Analyze Image</button>
+            </form>
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Analyzing image... Please wait</p>
+            </div>
+        </div>
+
+        <div class="results result-hidden" id="results">
+            <div id="errorMsg" class="error result-hidden"></div>
+            <div id="successContent">
+                <div class="image-preview">
+                    <img id="uploadedImage" src="" alt="Uploaded image" />
+                </div>
+
+                <div class="result-item">
+                    <h3>🎨 Color Analysis</h3>
+                    <p><strong>Final Colour:</strong> <span id="finalColorLabel"></span></p>
+                    <p><strong>Base Colour:</strong> <span id="baseColorLabel"></span></p>
+                </div>
+
+                <div class="result-item">
+                    <h3>✨ Texture</h3>
+                    <p><span id="textureLabel"></span></p>
+                </div>
+
+                <div class="result-item">
+                    <h3>📐 Shape</h3>
+                    <p><span id="shapeLabel"></span></p>
+                </div>
+
+                <div class="result-item">
+                    <h3>🔍 Cracks</h3>
+                    <p><span id="crackLabel"></span></p>
+                </div>
+
+                <div class="result-item">
+                    <h3>🧂 Coating</h3>
+                    <p><span id="coatingLabel"></span></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const fileInput = document.getElementById('imageInput');
+            const file = fileInput.files[0];
+            if (!file) return;
+            
+            const formData = new FormData();
+            formData.append('image', file);
+            
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results').classList.add('result-hidden');
+            
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                document.getElementById('loading').style.display = 'none';
+                
+                if (data.status === 'success') {
+                    document.getElementById('uploadedImage').src = 'data:image/jpeg;base64,' + data.uploaded_image;
+                    document.getElementById('finalColorLabel').textContent = data.color.final_colour || 'N/A';
+                    document.getElementById('baseColorLabel').textContent = data.color.base_colour || 'N/A';
+                    document.getElementById('textureLabel').textContent = data.texture.label || 'N/A';
+                    document.getElementById('shapeLabel').textContent = data.shape.label || 'N/A';
+                    document.getElementById('crackLabel').textContent = data.cracks.label || 'N/A';
+                    document.getElementById('coatingLabel').textContent = data.coating.label || 'N/A';
+                    document.getElementById('results').classList.remove('result-hidden');
+                } else {
+                    showError(data.message || 'Analysis failed');
+                }
+            } catch (error) {
+                document.getElementById('loading').style.display = 'none';
+                showError('Error: ' + error.message);
+            }
+        });
+        
+        function showError(message) {
+            const errorDiv = document.getElementById('errorMsg');
+            errorDiv.textContent = message;
+            errorDiv.classList.remove('result-hidden');
+            document.getElementById('results').classList.remove('result-hidden');
+        }
+        
+        const uploadArea = document.querySelector('.upload-area');
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, preventDefaults, false);
+        });
+        
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+        
+        ['dragenter', 'dragover'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, () => uploadArea.style.background = '#f0f0f0');
+        });
+        
+        ['dragleave', 'drop'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, () => uploadArea.style.background = '');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            const dt = e.dataTransfer;
+            const files = dt.files;
+            document.getElementById('imageInput').files = files;
+        });
+    </script>
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------------
 # Routes
-# ------------------------------
+# ------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "device": str(DEVICE)}), 200
@@ -270,65 +236,63 @@ def health():
 def analyze():
     if "image" not in request.files:
         return jsonify({"status": "error", "message": "No image file provided"}), 400
+
     file = request.files["image"]
     if file.filename == "":
         return jsonify({"status": "error", "message": "Empty filename"}), 400
 
     try:
-        pil_img = Image.open(io.BytesIO(file.read())).convert('RGB')
+        pil_img = Image.open(io.BytesIO(file.read())).convert("RGB")
     except Exception as e:
-        return jsonify({"status": "error", "message": f"Invalid image: {str(e)}"}), 400
+        return jsonify({"status": "error", "message": f"Invalid image: {e}"}), 400
 
     # Colour analysis
     try:
-        color_result = predict_advanced_color(models["color"], pil_img)
+        color_result = predict_advanced_color(models["color"], pil_img, DEVICE)
     except Exception as e:
         logging.error(f"Colour model error: {e}")
-        color_result = {"final_colour": "error", "base_colour": "error", "confidence": 0, "coated": False, "coating_ratio": 0.0}
+        color_result = {
+            "final_colour": "error", "base_colour": "error",
+            "confidence": 0.0, "coated": False, "coating_ratio": 0.0,
+        }
 
-    # Other models
+    # Texture
     try:
         texture_result = predict_texture(models["texture"], pil_img)
     except Exception as e:
         logging.error(f"Texture model error: {e}")
         texture_result = {"label": "error"}
+
+    # Shape
     try:
-        shape_result = predict_shape(models["shape_cnn"], models["shape_classes"], models["shape_ml"], pil_img)
+        shape_result = predict_shape(
+            models["shape_cnn"], models["shape_classes"], models["shape_ml"], pil_img
+        )
     except Exception as e:
         logging.error(f"Shape model error: {e}")
         shape_result = {"label": "error"}
+
+    # Cracks
     try:
         crack_result = predict_crack(models["crack"], pil_img)
     except Exception as e:
         logging.error(f"Crack model error: {e}")
         crack_result = {"label": "error"}
-    try:
-        coating_result = detect_coating(pil_img)
-    except Exception as e:
-        logging.error(f"Coating detection error: {e}")
-        coating_result = {"label": "error"}
 
-    # Overall confidence using refined final_colour
-    overall_confidence = compute_confidence(
-        color_result["final_colour"], 
-        texture_result["label"], 
-        shape_result["label"], 
-        crack_result["label"], 
-        coating_result["label"]
-    )
-
-    # Encode image
-    img_base64 = encode_image(pil_img)
+    # Coating (derived from colour result)
+    coating_result = {
+        "label": "white" if color_result.get("coated", False) else "none",
+        "ratio": color_result.get("coating_ratio", 0.0)
+    }
 
     response = {
-        "status": "success",
-        "uploaded_image": img_base64,
-        "color": color_result,
-        "texture": texture_result,
-        "shape": shape_result,
-        "cracks": crack_result,
-        "coating": coating_result,
-        "confidence_score": overall_confidence
+        "status":           "success",
+        "uploaded_image":   encode_image(pil_img),
+        "color":            color_result,
+        "texture":          texture_result,
+        "shape":            shape_result,
+        "cracks":           crack_result,
+        "coating":          coating_result,
     }
     return jsonify(response), 200
 
