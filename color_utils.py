@@ -5,15 +5,12 @@ import torch
 import timm
 from torchvision import transforms
 
-# ------------------------------
-# Constants for coating detection
-# ------------------------------
-WHITE_V_MIN    = 200      # minimum Value for white coating
-WHITE_S_MAX    = 40       # maximum Saturation for white coating
-COAT_THRESHOLD = 0.08     # 8% coating area triggers detection
-MIN_BLOB_AREA  = 400      # ignore tiny specks
+# Constants
+WHITE_V_MIN    = 200
+WHITE_S_MAX    = 40
+COAT_THRESHOLD = 0.08
+MIN_BLOB_AREA  = 400
 
-# Per‑colour thresholds for coating override (from your original)
 COAT_LIMITS = {
     "deep red": 0.25, "red": 0.20, "dark red purple": 0.22,
     "pink": 0.15, "pale red": 0.10, "pale pink": 0.09,
@@ -23,46 +20,36 @@ COAT_LIMITS = {
     "blue purple": 0.18,
 }
 
-# ------------------------------
-# Helper: HSV statistics
-# ------------------------------
 def hsv_stats(img_np):
     hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV).astype(float)
     h, s, v = cv2.split(hsv)
     return {
-        'mh':   float(np.median(h)),
-        'ms':   float(np.median(s)),
-        'mv':   float(np.median(v)),
+        'mh': float(np.median(h)),
+        'ms': float(np.median(s)),
+        'mv': float(np.median(v)),
         'p75s': float(np.percentile(s, 75)),
     }
 
-# ------------------------------
-# Coating detection (white/yellow)
-# ------------------------------
 def coating_ratio(img_np):
     hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-    # White coating mask
     mask = cv2.inRange(hsv, (0, 0, WHITE_V_MIN), (180, WHITE_S_MAX, 255))
-    # Yellowish coating (hue 20-30, low sat, high value)
     mask_yellow = cv2.inRange(hsv, (20, 30, 180), (30, 80, 255))
     mask = cv2.bitwise_or(mask, mask_yellow)
-    # Morphological cleanup
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    # Remove tiny connected components
     _, labels = cv2.connectedComponents(mask)
-    blobs = [
-        np.sum(labels == i)
-        for i in range(1, labels.max() + 1)
-        if np.sum(labels == i) > MIN_BLOB_AREA
-    ]
+    blobs = [np.sum(labels == i) for i in range(1, labels.max() + 1) if np.sum(labels == i) > MIN_BLOB_AREA]
     total_pixels = img_np.shape[0] * img_np.shape[1]
     ratio = float(sum(blobs) / total_pixels) if total_pixels > 0 else 0.0
     coated = ratio > COAT_THRESHOLD
     return coated, ratio
 
-# ------------------------------
-# Refine raw model output to base colour
-# ------------------------------
+def map_red_variants(colour):
+    """Map any red variant to 'red'."""
+    red_variants = {"deep red", "pale red", "dark red purple"}
+    if colour in red_variants:
+        return "red"
+    return colour
+
 def refine(raw_class, stats):
     mh, ms, mv = stats['mh'], stats['ms'], stats['mv']
     red_hue    = (mh <= 15) or (mh >= 168)
@@ -89,7 +76,7 @@ def refine(raw_class, stats):
             return "pale pink"
         if ms < 90:
             return "pale"
-        return "pale red"
+        return "pale red"   # will be mapped to "red"
     if mv >= 160 and ms < 80:
         return "pale pink"
 
@@ -146,15 +133,11 @@ def refine(raw_class, stats):
 
     return raw_class
 
-# ------------------------------
-# Decide final colour based on coating
-# ------------------------------
 def coating_override(base_colour, coated, ratio, stats):
     if not coated:
-        return base_colour
+        return map_red_variants(base_colour)
     red_hue = (stats['mh'] <= 15) or (stats['mh'] >= 168)
     p75s = stats['p75s']
-    # Special handling for red‑family tongues
     if red_hue and base_colour in ("pale pink", "pale", "pale red", "pink"):
         sat_spread = p75s - stats['ms']
         if sat_spread >= 25 and ratio >= 0.18:
@@ -162,16 +145,12 @@ def coating_override(base_colour, coated, ratio, stats):
         elif ratio >= 0.40:
             return "white coated"
         else:
-            return base_colour
-    # Default per‑colour threshold
+            return map_red_variants(base_colour)
     threshold = COAT_LIMITS.get(base_colour, COAT_THRESHOLD)
     if ratio >= threshold:
         return "white coated"
-    return base_colour
+    return map_red_variants(base_colour)
 
-# ------------------------------
-# Load colour model from checkpoint
-# ------------------------------
 def load_color_model(model_path, device):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Colour model not found: {model_path}")
@@ -189,45 +168,23 @@ def load_color_model(model_path, device):
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
-    return {
-        'model': model,
-        'class_names': class_names,
-        'transform': transform,
-        'img_size': img_size,
-    }
+    return {'model': model, 'class_names': class_names, 'transform': transform, 'img_size': img_size}
 
-# ------------------------------
-# Main prediction function
-# ------------------------------
 def predict_advanced_color(color_model, pil_img, device):
-    """
-    Returns:
-        final_colour   : e.g. "white coated" (if coating detected) or base colour
-        base_colour    : underlying colour from model + HSV refinement
-        confidence     : float 0-1 (softmax probability)
-        coated         : bool
-        coating_ratio  : float 0-1
-    """
-    # Model inference with softmax
     tensor = color_model['transform'](pil_img).unsqueeze(0).to(device)
     with torch.no_grad():
         logits = color_model['model'](tensor)
         probs = torch.softmax(logits, dim=1).squeeze().cpu().tolist()
     idx = probs.index(max(probs))
     raw_class = color_model['class_names'][idx]
-    confidence = probs[idx]   # 0.0 – 1.0
-
-    # HSV analysis
+    confidence = probs[idx]
     img_np = np.array(pil_img.convert('RGB'))
     stats = hsv_stats(img_np)
     coated, ratio = coating_ratio(img_np)
-
-    # Base colour (without coating influence)
     base_colour = refine(raw_class, stats)
-
-    # Final colour (apply coating override)
+    base_colour = map_red_variants(base_colour)
     final_colour = coating_override(base_colour, coated, ratio, stats)
-
+    final_colour = map_red_variants(final_colour)
     return {
         'final_colour':   final_colour,
         'base_colour':    base_colour,
