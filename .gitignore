@@ -1,8 +1,5 @@
-# Model artifacts (large binaries)
-models/*.pth
-models/*.pkl
-models/*.pt
-models/*.onnx
+# Model artifacts and directories (kept out of git)
+models/
 
 # OS
 .DS_Store
