@@ -1,0 +1,8 @@
+# Model artifacts (large binaries)
+models/*.pth
+models/*.pkl
+models/*.pt
+models/*.onnx
+
+# OS
+.DS_Store
