@@ -6,48 +6,69 @@ import torch
 from flask import Flask, request, jsonify, render_template_string
 from PIL import Image
 
-from utils.color_utils   import load_color_model, predict_advanced_color
-from utils.texture_utils import load_texture_model, predict_texture
-from utils.shape_utils   import load_shape_cnn, load_shape_ml, predict_shape
-from utils.crack_utils   import load_crack_model, predict_crack
-from utils.image_utils   import encode_image
+from color_utils import load_color_model, predict_advanced_color
+from texture_utils import load_texture_model, predict_texture
+from shape_utils import load_shape_cnn, load_shape_ml, predict_shape
+from crack_utils import load_crack_model, predict_crack
+from image_utils import encode_image
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device(
+    "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+)
 logging.info(f"Using device: {DEVICE}")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
+def _first_existing_path(*relative_paths):
+    for rel in relative_paths:
+        candidate = os.path.join(MODELS_DIR, rel)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
 MODEL_PATHS = {
-    "color":     os.path.join(MODELS_DIR, "efficientnetv2_tongue_color_50epochs.pth"),
-    "shape_cnn": os.path.join(MODELS_DIR, "tongue_cnn_v3.pth"),
-    "shape_ml":  os.path.join(MODELS_DIR, "tongue_ml_ensemble.pkl"),
-    "crack":     os.path.join(MODELS_DIR, "cracked_binary_resnet5.pth"),
+    "color": _first_existing_path(
+        "efficientnetv2_tongue_color.pth",
+        "efficientnetv2_tongue_color_30epochs.pth",
+        "efficientnetv2_tongue_color_50epochs.pth",
+    ),
+    "shape_cnn": _first_existing_path("tongue_cnn_v3.pth"),
+    "shape_ml": _first_existing_path("tongue_ml_ensemble.pkl"),
+    "crack": _first_existing_path("cracked_binary_resnet50.pth"),
 }
 
 models = {}
 
+def _require_path(key):
+    path = MODEL_PATHS.get(key)
+    if not path:
+        raise FileNotFoundError(
+            f"Missing model file for '{key}'. Expected file in {MODELS_DIR}."
+        )
+    return path
+
 def load_all_models():
     logging.info("Loading colour model...")
-    models["color"] = load_color_model(MODEL_PATHS["color"], DEVICE)
+    models["color"] = load_color_model(_require_path("color"), DEVICE)
 
     logging.info("Loading texture model...")
     models["texture"] = load_texture_model()
 
     logging.info("Loading shape CNN...")
     models["shape_cnn"], models["shape_classes"] = load_shape_cnn(
-        MODEL_PATHS["shape_cnn"], DEVICE
+        _require_path("shape_cnn"), DEVICE
     )
 
     logging.info("Loading shape ML ensemble...")
-    models["shape_ml"] = load_shape_ml(MODEL_PATHS["shape_ml"])
+    models["shape_ml"] = load_shape_ml(_require_path("shape_ml"))
 
     logging.info("Loading crack model...")
-    models["crack"] = load_crack_model(MODEL_PATHS["crack"], DEVICE)
+    models["crack"] = load_crack_model(_require_path("crack"), DEVICE)
 
     logging.info("All models loaded successfully.")
 
@@ -254,6 +275,7 @@ def analyze():
         color_result = {
             "final_colour": "error", "base_colour": "error",
             "confidence": 0.0, "coated": False, "coating_ratio": 0.0,
+            "coating_color": "error",
         }
 
     # Texture
@@ -281,7 +303,7 @@ def analyze():
 
     # Coating (derived from colour result)
     coating_result = {
-        "label": "white" if color_result.get("coated", False) else "none",
+        "label": color_result.get("coating_color", "none"),
         "ratio": color_result.get("coating_ratio", 0.0)
     }
 
